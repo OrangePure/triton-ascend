@@ -226,18 +226,43 @@ masked 单遍 kernel 在 192 KB UB 下：
 
 即 **A2/A3 上 `BLOCK × ROWS ≤ 8192`（masked）**；A5 的 248 KB 可放宽，但以 A2 为下限即可保证三平台一致。
 
-### 6.4 grid 扫描结果（前向）
+### 6.4 grid 必须逐 shape 选择
 
-| H | BLOCK | 最优 grid | liger | torch | ratio |
-|---|---|---|---|---|---|
-| 2048 | 2048 | 128 | 58.72 | 86.54 | **0.679** |
-| 3584 | 4096 | 48 | 84.70 | 125.67 | **0.674** |
-| 4096 | 4096 | 48 | 74.88 | 95.73 | **0.782** |
-| 5120 | 8192 | 96 | 153.75 | 130.70 | **1.176** |
-| 7168 | 8192 | 96 | 155.96 | 262.56 | **0.594** |
-| 8192 | 8192 | 192 | 137.24 | 217.00 | **0.632** |
+同一 shape 下 grid 的影响可达 2 倍：
 
-**5/6 个配置达标，H=5120 仍差 17.6%（见 7.2 待解决项）。**
+| grid | 24 | 48 | 96 | 192 | 384 | 1536 | 4096 |
+|---|---|---|---|---|---|---|---|
+| H=2048 (ms) | 0.1533 | 0.0833 | **0.0804** | 0.0801 | 0.0803 | 0.0862 | 0.1888 |
+| H=8192 (ms) | 0.2686 | 0.1455 | 0.1426 | **0.1426** | 0.1452 | 0.1608 | 0.1982 |
+
+规律：grid 过小（24，即一核两 program）严重串行；grid = n_rows 也明显变差。
+最终实现按 shape 探测 `{cores, 2×cores, 4×cores, 8×cores}`，取 3 轮中位数最优值。
+
+### 6.5 端到端成本分解（H=2048，前向）
+
+| 阶段 | 耗时 (ms) | 增量 |
+|---|---|---|
+| ① 直接调用 triton kernel（输出预分配） | 0.0799 | — |
+| ② + Y/Mean/RSTD 分配 | 0.1102 | **+0.0303** |
+| ③ + `autograd.Function.apply` | 0.1422 | **+0.0320** |
+| ④ + `nn.Module.__call__` | 0.1485 | +0.0063 |
+| — torch `F.layer_norm` | 0.0884 | 基准 |
+
+**kernel 本体（0.0799）已快于 torch（0.0884），差距全部来自框架层。**
+
+### 6.6 框架固定成本（本次最关键发现）
+
+| 项 | triton-ascend | torch |
+|---|---|---|
+| 空 kernel 单次 launch | **38~39 µs** | ~18 µs |
+| autograd 前向开销 | +32 µs | — |
+| autograd 反向开销 | +130~140 µs | — |
+
+launch 固定成本的源码位置：`triton/backends/ascend/driver.py` 每次 launch 都执行
+`device_res_manager_->BindDeviceToCurrentThread(false)` + `syncBlockLock` 分配 + 初始化 H2D 写入，
+与 grid 大小无关。`TRITON_ENABLE_TASKQUEUE=false` 实测更慢（68 µs），无环境变量可关闭。
+
+LayerNorm 端到端仅 0.09~0.29 ms，上述两项固定成本占 40%~70%，与 kernel 效率无关。
 
 ---
 
@@ -281,8 +306,20 @@ masked 单遍 kernel 在 192 KB UB 下：
 
 ```
 pytest test/transformers/test_layer_norm.py  →  16 passed, 0 failed, 0 error
-benchmark_layer_norm.py --sweep-mode model_config --bt 65536  → 正常产出
+benchmark_layer_norm.py --sweep-mode model_config --bt 65536 --overwrite  → 正常产出
 ```
+
+注意：`benchmark_layer_norm.py` 默认 `overwrite=False`，不加 `--overwrite` 时新结果不会写入 CSV。
+
+### 9.1.1 调试过程中修掉的实现缺陷
+
+| # | 缺陷 | 后果 |
+|---|---|---|
+| 1 | masked 路径 `BLOCK < n_cols` 时无列循环 | 统计量截断，误差 1e+38 |
+| 2 | `grid > n_rows` 时空 program 不写部分和 | dW/dB 错误 |
+| 3 | workspace 复用留下脏数据 | 小 shape 用例失败 |
+| 4 | Triton 归约 kernel 非确定性错误 | 同输入时对时错，改用 torch `sum(0)` |
+| 5 | autotune 探针重复执行 atomic kernel | dW/dB 被累加 26 倍 |
 
 ### 9.2 A3 / A5 设备状态
 
@@ -292,10 +329,40 @@ benchmark_layer_norm.py --sweep-mode model_config --bt 65536  → 正常产出
 
 ---
 
-## 10. 待解决项
+## 10. 当前实现状态与待解决项
+
+### 10.1 已实现并验证
+
+| 项 | 状态 |
+|---|---|
+| 前向单遍融合 kernel（支持任意 `n_cols`，`BLOCK` 覆盖整行） | ✅ 已装入 `_ascend/ops/layer_norm.py` |
+| 反向 `tl.atomic_add` 直接累加 dW/dB（去掉一次 launch + 归约） | ✅ |
+| 大 H（>4096）反向两段列切分 | ✅ |
+| 逐 shape 自动选 grid（3 轮中位数） | ✅ |
+| runtime 探测 UB，A2/A3/A5 共用代码 | ✅ |
+| 功能验收 | ✅ `pytest` 16 passed / 0 failed / 0 error |
+
+### 10.2 各 hidden size 实测（交替 A/B，15 次中位数）
+
+前向：
+
+| H | torch (ms) | liger (ms) | ratio |
+|---|---|---|---|
+| 8192 | 0.2194 | 0.1661 | **0.757 ✅** |
+| 7168 | 0.2654 | 0.1681 | **0.633 ✅** |
+| 5120 | 0.1334 | 0.1758 | 1.318 |
+| 4096 | 0.0968 | 0.1759 | 1.818 |
+| 3584 | 0.1293 | 0.1533 | 1.185 |
+| 2048 | 0.0917 | 0.1504 | 1.640 |
+
+反向 6 个配置 ratio 1.70~2.72。
+
+**大 H 达标、小 H 不达标**，原因即 §6.6 的固定成本——小 H 时计算量小，固定成本占比高。
+
+### 10.3 待解决项
 
 | 编号 | 问题 | 计划 |
 |---|---|---|
-| T1 | H=5120 前向 ratio 1.18 | 尝试 main+tail 无掩码切分、autotune BLOCK、或在 A5 更大 UB 下复发 |
-| T2 | 反向整体重构未落地 | 按 5.3 实现 B1，目标全部 ratio ≤ 1.0 |
+| T1 | 小 H 前向/反向因 launch 与 autograd 固定成本无法达标 | 需框架侧优化，或在 PR 中说明限制 |
+| T2 | 测量环境不干净 | 验证节点跑着 sglang 推理（16 die HBM 各约 54GB，load≈32），需独占节点复测 |
 | T3 | A5 实测 | 待设备 |
