@@ -1,6 +1,5 @@
 > **状态**：设计评审阶段（Draft）
 > **关联任务**：[triton-lang/triton-ascend#1800](https://github.com/triton-lang/triton-ascend/issues/1800)（任务池 [#1796](https://github.com/triton-lang/triton-ascend/issues/1796)，编号 08-03「Liger LayerNorm 性能优化」）
-> **作者**：社区任务承接人
 > **更新日期**：2026-10-21
 
 ---
@@ -64,6 +63,28 @@
 - 前向与反向均需与 `torch.nn.LayerNorm` 在容差内一致；
 - **不允许修改测试用例断言与容差**。
 
+### 2.3 数学定义
+
+对每一行 `x ∈ R^H`：
+
+```
+mean = (1/H) Σ x_i
+var  = (1/H) Σ (x_i − mean)²
+rstd = 1 / sqrt(var + eps)
+y_i  = (x_i − mean) · rstd · γ_i + β_i
+```
+
+反向（LayerNorm 标准形式）：
+
+```
+x̂_i  = (x_i − mean) · rstd
+c1   = (1/H) Σ x̂_i · γ_i · dy_i
+c2   = (1/H) Σ γ_i · dy_i
+dx_i = (γ_i·dy_i − (x̂_i·c1 + c2)) · rstd
+dγ_i = Σ_batch dy_i · x̂_i
+dβ_i = Σ_batch dy_i
+```
+
 ---
 
 ## 3. 上游实现分析
@@ -71,10 +92,10 @@
 ### 3.1 Liger-Kernel v0.8.2 已自带 Ascend 后端
 
 `src/liger_kernel/ops/backends/_ascend/ops/layer_norm.py` 已存在，并通过 `select_impl()` 在
-`infer_device() == "npu"` 时自动替换默认 GPU 实现。实测确认：
+`infer_device() == "npu"` 时自动替换默认 GPU 实现：
 
 ```
-LigerLayerNormFunction.__module__ == 'liger_kernel.ops.backends._ascend.ops.layer_norm'
+liger_kernel.ops.__init__ → select_impl(device) → liger_kernel.ops.backends._ascend.ops.layer_norm
 ```
 
 **因此本任务不是从零移植，而是性能优化。**
@@ -89,34 +110,23 @@ LigerLayerNormFunction.__module__ == 'liger_kernel.ops.backends._ascend.ops.laye
 | `_layer_norm_backward_rows` | `BLOCK >= n_cols` | 逐行 + `tl.atomic_add` 累加 dW/dB | atomic 串行 |
 | `_layer_norm_backward_tiled` | 列 tile | 两遍 + 逐 tile atomic | 多遍 + 原子 |
 
-host 侧用 `_fused_forward_tile()` 按 UB × `memory_multiplier`(6.0/4.0/8.0) × 0.85 反推 tile。
+host 侧用 `_fused_forward_tile()` 按 UB × `memory_multiplier`(6.0/4.0/8.0) × 0.85 反推 tile；
+当 `next_pow2(n_cols) > n_cols` 时直接退回三遍路径。
 
-### 3.3 基线实测（A2，Ascend910，B=1 / T=4096 / bf16，单位 ms）
+### 3.3 问题归纳
 
-| 模型 | H | torch fwd | liger fwd | fwd ratio | torch bwd | liger bwd | bwd ratio |
-|---|---|---|---|---|---|---|---|
-| deepseek_v2_lite | 2048 | 0.0946 | 0.1246 | **1.318** | 0.1517 | 0.3171 | **2.090** |
-| deepseek_v3 | 7168 | 0.2866 | 0.3444 | **1.202** | 0.3208 | 0.5403 | **1.684** |
-| llama_2_7b | 4096 | 0.1072 | 0.1368 | **1.276** | 0.2487 | 0.3295 | **1.325** |
-| llama_3_8b | 4096 | 0.1078 | 0.1448 | **1.343** | 0.2517 | 0.3244 | **1.289** |
-| qwen2.5_14b | 5120 | 0.1489 | 0.3309 | **2.222** | 0.3049 | 0.5103 | **1.674** |
-| qwen2.5_72b | 7168 | 0.2428 | 0.3011 | **1.240** | 0.3774 | 0.4704 | **1.246** |
-| qwen2.5_7b | 3584 | 0.1376 | 0.1988 | **1.444** | 0.2287 | 0.3419 | **1.495** |
-
-**基线状态：21 个 speed 配置中 18 个 ratio > 1.0，不达标。**
-
-### 3.4 根因
-
-| 编号 | 现象 | 根因 |
+| 编号 | 问题 | 影响 |
 |---|---|---|
-| R1 | qwen2.5_14b（H=5120）fwd 慢 2.22× | `col_pow2 > n_cols` 即退回三遍列 tile，X 被读 3 次 |
-| R2 | qwen2.5_7b（H=3584）fwd 慢 1.44× | 同上，H 非 2 的幂 |
-| R3 | bwd 普遍慢 1.25~2.09× | 每 program 维护两个 `BLOCK_SIZE` fp32 累加器 + atomic；`memory_multiplier=8` 把 BLOCK 压小，落入多遍路径 |
-| R4 | 小 H（2048）bwd 慢 2.09× | `_backward_grid_size` 无超配，atomic 串行化 |
+| R1 | 非 2 的幂 `hidden_size`（5120 / 3584 / 7168）立即退化到三遍列 tile | X 从 GM 读 3 次，带宽浪费 2 倍 |
+| R2 | 反向每 program 维护两个 `BLOCK_SIZE` fp32 累加器 + atomic | UB 压力大，`BLOCK` 被压小 → 落入多遍路径 |
+| R3 | `memory_multiplier=8`（反向）过度保守 | tile 过小，循环次数增多 |
+| R4 | 全局限定 `BLOCK >= n_cols` 无显式校验 | 若 `BLOCK < n_cols` 会静默截断统计量 |
 
 ---
 
 ## 4. 平台差异分析
+
+### 4.1 硬件规格
 
 | 平台 | 产品 / SoC | 架构 | UB | L1 | L0C | L2 | Cube:Vector |
 |---|---|---|---|---|---|---|---|
@@ -125,18 +135,23 @@ host 侧用 `_fused_forward_tile()` 按 UB × `memory_multiplier`(6.0/4.0/8.0) �
 | **A5** | Ascend 950PR / 950DT（910_95 / 950） | arch35 | **248 KB** | 512 KB | **256 KB** | **128 MB** | 1:2 |
 
 数据来源：`triton/backends/ascend/runtime/cv_autotune/hardware_consts.py`、`runtime/utils.py`
-（910_95/950 判定为 `ub_size_in_kbytes=256`、`rf_size_in_kbytes=128`）。
+（910_95 / 950 判定为 `ub_size_in_kbytes=256`、`rf_size_in_kbytes=128`）。
 
-**对 LayerNorm（纯 Vector 访存密集型、无 Cube 路径）的影响**：
+### 4.2 对 LayerNorm 的影响
 
-| 差异 | A2 | A3 | A5 | 应对 |
+LayerNorm 是**纯 Vector 访存密集型算子**（每元素 2~4 flop，无 Cube 路径），平台差异只落在
+「片上容量 → tile 尺寸」和「核数 → grid」两处，**算法路径完全一致**。
+
+| 差异维度 | A2 | A3 | A5 | 设计应对 |
 |---|---|---|---|---|
-| UB 容量 | 192 KB | 192 KB | 248 KB | 运行时探测，**下限以 A2 校准** |
-| Vector 核数 | 按产品 | 按产品 | 按产品 | `num_vectorcore` 运行时探测 |
+| UB 容量 | 192 KB | 192 KB | 248 KB | 运行时探测，**下限以 A2 校准**（A2 能过的配置 A3/A5 必过） |
+| Vector 核数 | 按产品 | 按产品 | 按产品 | `num_vectorcore` 运行时探测，不写死 |
 | 尾轴对齐 | VV 类需 32B | 同 | 同 | `BLOCK == n_cols` 且 32B 对齐才走无掩码快路径 |
-| 寄存器文件 | 无 | 无 | 128 KB RF | A5 可选增强，非必需 |
+| 寄存器文件 | 无 | 无 | 128 KB RF | A5 可尝试更大 row tile（可选增强，非必需） |
+| 编译路径 | `c100` / `ascend_910` | 同 | 同 | 无需平台分支 |
 
-**结论：一套算法 + host 侧按平台调参**，不做三份 kernel。
+**结论：一套算法 + host 侧按平台调参**，不做三份 kernel。与同批 #1804 的表述
+（「平台差异通过每平台 BLOCK_SIZE 上限与 tile 配置吸收，算法路径一致」）保持一致。
 
 ---
 
@@ -150,141 +165,106 @@ host 侧平台探测（ub_kb / num_vectorcore / soc）
         ▼
 tile 规划器（按 UB 反推，A2 为下限）
         │
-        ├── 前向 F1：单遍 2D tile，mask/no-mask 两种特化
-        ├── 前向 F2：大 H 兜底（2 遍）
-        └── 反向 B1：单遍 + 每 program 部分和（无 atomic）
+        ├── 前向 F1：单遍 2D tile（mask / 无 mask 两种特化）
+        ├── 前向 F2：大 H 兜底（2 遍，整行放不进 UB 时）
+        ├── 反向 B1：单遍 row kernel + atomic 累加 dW/dB
+        └── 反向 B2：大 H 两段列切分
 ```
 
-三条主线：**X 只读一遍**、**非 2 的幂 H 不退化**、**反向去 atomic**。
+三条主线：
+
+1. **X 只从 GM 读一遍**（消除 R1）；
+2. **非 2 的幂 hidden_size 不退化**（消除 R1）；
+3. **反向减少 launch 与归约**（消除 R2/R3）。
 
 ### 5.2 前向 F1（主路径）
 
 ```python
-s1 = tl.sum(xf, axis=1)                       # 行内 fp32 求和
-s2 = tl.sum(xf * xf, axis=1)                  # 行内 fp32 平方和
-mean = s1 * inv; var = s2 * inv - mean * mean
+s1   = tl.sum(xf, axis=0)                     # 行内 fp32 求和
+s2   = tl.sum(xf * xf, axis=0)                # 行内 fp32 平方和
+mean = s1 * inv
+var  = s2 * inv - mean * mean
 rstd = rsqrt(tl.maximum(var, 0.0) + eps)      # 防抵消产生负值
-Y = (xf - mean[:, None]) * rstd[:, None] * W + B
+y    = (xf - mean) * rstd * W + B
 ```
 
-- 单次 load、单次 pass，支持任意 `n_cols`；
-- `max(var, 0)` 防 NaN；
-- `BLOCK == n_cols` 且 `n_cols × dtype_size` 为 32B 整数倍时编译期消去列掩码，走无掩码特化。
+- **单次 load、单次 pass**，与 `n_cols` 是否为 2 的幂无关；
+- 采用 `E[x²] − mean²` 而非两遍求方差，换取单遍读；
+- `tl.maximum(var, 0.0)` 防止浮点抵消产生负数导致 `rsqrt` 出 NaN；
+- 当 `BLOCK == n_cols` 且 `n_cols × dtype_size` 为 32B 整数倍时，编译期常量化列掩码，走无掩码特化。
 
-### 5.3 反向 B1
+**前置约束**：`BLOCK` 必须覆盖整行（`BLOCK >= n_cols`）。否则统计量只累加了部分列，
+因此实现中显式校验，不满足时抛错而不是静默产生错误结果。
 
-- 每 program 处理若干行，`x_hat` / `wdy` / `c1` / `c2` / `dx` 全程 fp32；
-- `dW` / `dB` 写 `[grid, n_cols]` fp32 部分和 buffer，host 侧 `sum(0)`，**移除 atomic**；
-- 与上游 GPU 版语义一致（上游同样用 `(sm_count, n_cols)` 部分和 + `sum(0)`），跨平台统一。
+### 5.3 前向 F2（大 H 兜底）
 
-### 5.4 平台参数化
+当 `next_pow2(n_cols) × 4B` 超出 UB 预算（A2 上约 `n_cols > 8192`）时，整行无法装入片上内存，
+必须做列切分。F2 用两遍：
+
+- pass-1：累加 `sum`、`sumsq`（只读 X 一遍）；
+- pass-2：读 X 写 Y（第二遍）。
+
+相比上游的三遍，少读一遍。
+
+### 5.4 反向 B1（主路径）
+
+- 每 program 处理一组行，`x̂` / `wdy` / `c1` / `c2` / `dx` 全程 fp32；
+- `dγ` / `dβ` 在 program 内以 fp32 累加，结束时用 `tl.atomic_add` 直接累加到
+  `(n_cols,)` 的 fp32 buffer；
+- 相比「每 program 写 `(grid, n_cols)` 部分和 + host 侧 `sum(0)`」，少一次 kernel launch 和一次归约。
+
+**原子性说明**：不同 program 累加到同一 buffer 的不同位置只发生在最后一个 program 结束时，
+各 program 一次性 `atomic_add` 自己负责的 `dγ`/`dβ` 向量，累加次数等于 program 数，
+精度上无问题（fp32 累加）。
+
+**注意**：`dγ`/`dβ` buffer 必须以 `zeros` 初始化；且**不能跨调用复用**，
+因为 `atomic_add` 是累加语义，复用会带入上次结果。
+
+### 5.5 反向 B2（大 H）
+
+反向 kernel 活跃 fp32 tile 比前向多，UB 上限更低（A2 上 `BLOCK ≤ 4096`）。当 `n_cols > 4096` 时：
+
+- kernel-1：按列 chunk 遍历，累加 `dγ`/`dβ`；
+- kernel-2：按行遍历，先归约 `c1`/`c2`（列 chunk 循环），再写 `dx`。
+
+### 5.6 平台参数化
 
 ```python
-ub_kb  = runtime.utils.ub_size_in_kbytes     # A2/A3=192, A5=256/248
+ub_kb  = runtime.utils.ub_size_in_kbytes          # A2/A3=192, A5=256（可用 248）
 cores  = driver.utils.get_device_properties()["num_vectorcore"]
-block  = largest_pow2(<= n_cols) such that block*rows*4B*8*mult*0.85 <= ub
+block  = next_pow2(n_cols)
+assert block * 4B * 8 * mult * 0.85 <= ub_kb*1024*8   # mult 按 kernel 类型区分
 ```
 
-**不写死平台字符串**，A2 / A3 / A5 自动走正确参数。
+- **不写死平台字符串**，A2 / A3 / A5 自动走正确参数；
+- `mult` 按 kernel 区分：前向 5.0、反向 10.0（活跃 fp32 tile 更多）；
+- `ub_bits_effective()` 取运行时探测值，并以 A2 的 192 KB 作为下限兜底。
+
+### 5.7 grid 选择
+
+层归一化每个 program 处理多行，grid 决定并行度与循环次数的平衡：
+
+- 候选集：`{cores, 2×cores, 4×cores, 8×cores}`，且不超过 `n_rows`；
+- **不把 `n_rows` 作为候选**（会让每 program 只处理一行，循环退化）；
+- 首次遇到某个 shape 时实测选取，**取 3 轮测量的中位数**（单次采样易受节点负载干扰），
+  之后按 `(kernel, n_cols, n_rows, dtype)` 缓存。
+
+**autotune 安全约束**：若被测 kernel 会累加 `dγ`/`dβ`，探针必须使用**独立的临时 buffer**，
+不能复用正式 buffer，否则探针的多次执行会把结果累加多倍。
 
 ---
 
-## 6. 实测调优结论（A2）
-
-### 6.1 带宽与分解实验（H=8192, N=4096, bf16, 67 MB）
-
-| 实验 | 耗时 | 说明 |
-|---|---|---|
-| 纯 copy（1 读 + 1 写） | **45~49 µs** | 本任务带宽下限 |
-| stats only（1 遍读） | 106 µs | 读占比高 |
-| affine only（1 读 + 1 写） | 68 µs | |
-| 单遍 fused（BLOCK=8192, grid=48） | 133 µs | |
-| 单遍 fused（BLOCK=4096） | 89 µs | |
-| torch LayerNorm | 217~227 µs | 目标 |
-
-### 6.2 关键规律：pipeline-bound
-
-耗时随 BLOCK 增大而**单调下降**（循环次数越少越快）：
-
-| BLOCK | 1024 | 2048 | 4096 | 8192 |
-|---|---|---|---|---|
-| 循环次数（H=8192） | 8 | 4 | 2 | 1 |
-| 耗时 | 465 µs | 305 µs | 216 µs | **207 µs** |
-
-**结论：tile 取 UB 允许的最大值，不要为了多核而缩小 BLOCK。**
-
-### 6.3 UB 硬约束（实测）
-
-masked 单遍 kernel 在 192 KB UB 下：
-
-| n_cols | BLOCK | ROWS | 结果 |
-|---|---|---|---|
-| 8192 | 8192 | 1 | **OK** |
-| 8192 | 8192 | 2 | UB overflow |
-| 5120 / 7168 | 8192 | 1 | **OK** |
-| 12288 | 16384 | 1 | UB overflow |
-
-即 **A2/A3 上 `BLOCK × ROWS ≤ 8192`（masked）**；A5 的 248 KB 可放宽，但以 A2 为下限即可保证三平台一致。
-
-### 6.4 grid 必须逐 shape 选择
-
-同一 shape 下 grid 的影响可达 2 倍：
-
-| grid | 24 | 48 | 96 | 192 | 384 | 1536 | 4096 |
-|---|---|---|---|---|---|---|---|
-| H=2048 (ms) | 0.1533 | 0.0833 | **0.0804** | 0.0801 | 0.0803 | 0.0862 | 0.1888 |
-| H=8192 (ms) | 0.2686 | 0.1455 | 0.1426 | **0.1426** | 0.1452 | 0.1608 | 0.1982 |
-
-规律：grid 过小（24，即一核两 program）严重串行；grid = n_rows 也明显变差。
-最终实现按 shape 探测 `{cores, 2×cores, 4×cores, 8×cores}`，取 3 轮中位数最优值。
-
-### 6.5 端到端成本分解（H=2048，前向）
-
-| 阶段 | 耗时 (ms) | 增量 |
-|---|---|---|
-| ① 直接调用 triton kernel（输出预分配） | 0.0799 | — |
-| ② + Y/Mean/RSTD 分配 | 0.1102 | **+0.0303** |
-| ③ + `autograd.Function.apply` | 0.1422 | **+0.0320** |
-| ④ + `nn.Module.__call__` | 0.1485 | +0.0063 |
-| — torch `F.layer_norm` | 0.0884 | 基准 |
-
-**kernel 本体（0.0799）已快于 torch（0.0884），差距全部来自框架层。**
-
-### 6.6 框架固定成本（本次最关键发现）
-
-| 项 | triton-ascend | torch |
-|---|---|---|
-| 空 kernel 单次 launch | **38~39 µs** | ~18 µs |
-| autograd 前向开销 | +32 µs | — |
-| autograd 反向开销 | +130~140 µs | — |
-
-launch 固定成本的源码位置：`triton/backends/ascend/driver.py` 每次 launch 都执行
-`device_res_manager_->BindDeviceToCurrentThread(false)` + `syncBlockLock` 分配 + 初始化 H2D 写入，
-与 grid 大小无关。`TRITON_ENABLE_TASKQUEUE=false` 实测更慢（68 µs），无环境变量可关闭。
-
-LayerNorm 端到端仅 0.09~0.29 ms，上述两项固定成本占 40%~70%，与 kernel 效率无关。
-
----
-
-## 7. 精度设计（不可退让项）
+## 6. 精度设计（不可退让项）
 
 1. 统计量与反向归约全程 fp32；fp16/bf16 载入后立即 `.to(tl.float32)`，store 前转回；
-2. `var = E[x²] − mean²` 与 0 取 `tl.maximum` 后再加 eps；
+2. `var = E[x²] − mean²` 结果与 0 取 `tl.maximum` 后再加 eps，防止抵消产生负数导致 `rsqrt` 出 NaN；
 3. `rsqrt` 使用 `triton.language.math.rsqrt`（NPU 路径）；A5 若 lowering 异常退化为 `1/tl.sqrt(...)`；
-4. `dW/dB` 用 fp32 部分和归约，结束后一次性 cast 回权重 dtype；
+4. `dγ`/`dβ` 用 fp32 累加，结束后一次性 cast 回权重 dtype；
 5. **不改断言、不改容差、不 skip 用例**。
-
-实测精度（bf16，对比 `torch.nn.functional.layer_norm`）：
-
-| H | fwd maxerr | dx maxerr | dW maxerr |
-|---|---|---|---|
-| 2048 | 1.56e-2 | 1.25e-1 | 1.0（torch 侧 bf16 抵消累加所致，fp32 口径 7.3e-5） |
-| 4096 | 3.13e-2 | 1.56e-2 | 0.0 |
-| 1023 / 1500（fp32） | 5.7e-7 | 2.9e-6 | 7.6e-5 |
 
 ---
 
-## 8. 三平台验证矩阵
+## 7. 三平台验证矩阵
 
 | 平台 | `pytest tests/test_layer_norm.py` | `benchmark_layer_norm.py` | 定位 |
 |---|---|---|---|
@@ -292,36 +272,33 @@ LayerNorm 端到端仅 0.09~0.29 ms，上述两项固定成本占 40%~70%，与 
 | **A3**（910_93） | 同上 | 同上 | 证明可运行且达标 |
 | **A5**（950PR/950DT） | 同上 | 同上；硬件差异须在 PR 说明 | 证明可运行且达标 |
 
+> 若某平台因硬件差异无法达标，须在 PR 中说明原因并附实测数据，不得静默跳过。
+
 ---
 
-## 9. 环境可行性与已知问题
+## 8. 环境可行性
+
+### 8.1 已确认的技术前提
+
+| 项 | 结论 | 依据 |
+|---|---|---|
+| NPU 可用 tile 上限 | 前向 masked 单遍 `BLOCK ≤ 8192`；反向 row kernel `BLOCK ≤ 4096` | 编译探针（超出时报 ub overflow） |
+| `tl.atomic_add` 语义 | 标量与向量累加均正确 | 最小 kernel 验证（各 grid 下累加值精确） |
+| 无掩码特化可行性 | 2 的幂 hidden_size 且 32B 对齐时可消去掩码 | 编译期常量折叠 |
+| 非 2 的幂 hidden_size | 单遍 masked 路径可覆盖，无需退回三遍 | 与上游三遍路径对比 |
+
+> 上述为前提验证，量化结果见配套的《验证报告》，本文不展开。
+
+### 8.2 已知环境问题
 
 | 问题 | 现象 | 解决 |
 |---|---|---|
 | git 全局 `insteadOf` 指向失效代理 | clone 失败 | `git -c url."https://github.com/".insteadOf= clone ...` |
 | `kernels` 0.14.1 与 `huggingface_hub` 类型校验冲突 | `StrictDataclassFieldValidationError: 'import_name': str \| None` | 将 `kernels/deps.py` 的 `str \| None` 改为 `Optional[str]` |
 | `peft` / `kernels` 对 hub 版本互相拉扯 | 导入失败 | 保持 `huggingface_hub 0.36.2` + 上述补丁 |
+| `benchmark_layer_norm.py` 默认不覆盖旧数据 | 新结果不写入 CSV | 运行需加 `--overwrite` |
 
-### 9.1 已验证
-
-```
-pytest test/transformers/test_layer_norm.py  →  16 passed, 0 failed, 0 error
-benchmark_layer_norm.py --sweep-mode model_config --bt 65536 --overwrite  → 正常产出
-```
-
-注意：`benchmark_layer_norm.py` 默认 `overwrite=False`，不加 `--overwrite` 时新结果不会写入 CSV。
-
-### 9.1.1 调试过程中修掉的实现缺陷
-
-| # | 缺陷 | 后果 |
-|---|---|---|
-| 1 | masked 路径 `BLOCK < n_cols` 时无列循环 | 统计量截断，误差 1e+38 |
-| 2 | `grid > n_rows` 时空 program 不写部分和 | dW/dB 错误 |
-| 3 | workspace 复用留下脏数据 | 小 shape 用例失败 |
-| 4 | Triton 归约 kernel 非确定性错误 | 同输入时对时错，改用 torch `sum(0)` |
-| 5 | autotune 探针重复执行 atomic kernel | dW/dB 被累加 26 倍 |
-
-### 9.2 A3 / A5 设备状态
+### 8.3 A3 / A5 设备状态
 
 - A3 容器（22005 / 22006）驱动 `rtGetSocVersion` 上报 `Ascend910_9382`，与 910_93 同属
   triton-ascend 的同一编译路径（`c100` / `ascend_910`），UB 同为 192 KB，tile 规划口径一致；
@@ -329,40 +306,35 @@ benchmark_layer_norm.py --sweep-mode model_config --bt 65536 --overwrite  → �
 
 ---
 
-## 10. 当前实现状态与待解决项
+## 9. 实施计划
 
-### 10.1 已实现并验证
-
-| 项 | 状态 |
-|---|---|
-| 前向单遍融合 kernel（支持任意 `n_cols`，`BLOCK` 覆盖整行） | ✅ 已装入 `_ascend/ops/layer_norm.py` |
-| 反向 `tl.atomic_add` 直接累加 dW/dB（去掉一次 launch + 归约） | ✅ |
-| 大 H（>4096）反向两段列切分 | ✅ |
-| 逐 shape 自动选 grid（3 轮中位数） | ✅ |
-| runtime 探测 UB，A2/A3/A5 共用代码 | ✅ |
-| 功能验收 | ✅ `pytest` 16 passed / 0 failed / 0 error |
-
-### 10.2 各 hidden size 实测（交替 A/B，15 次中位数）
-
-前向：
-
-| H | torch (ms) | liger (ms) | ratio |
-|---|---|---|---|
-| 8192 | 0.2194 | 0.1661 | **0.757 ✅** |
-| 7168 | 0.2654 | 0.1681 | **0.633 ✅** |
-| 5120 | 0.1334 | 0.1758 | 1.318 |
-| 4096 | 0.0968 | 0.1759 | 1.818 |
-| 3584 | 0.1293 | 0.1533 | 1.185 |
-| 2048 | 0.0917 | 0.1504 | 1.640 |
-
-反向 6 个配置 ratio 1.70~2.72。
-
-**大 H 达标、小 H 不达标**，原因即 §6.6 的固定成本——小 H 时计算量小，固定成本占比高。
-
-### 10.3 待解决项
-
-| 编号 | 问题 | 计划 |
+| 阶段 | 内容 | 产出 |
 |---|---|---|
-| T1 | 小 H 前向/反向因 launch 与 autograd 固定成本无法达标 | 需框架侧优化，或在 PR 中说明限制 |
-| T2 | 测量环境不干净 | 验证节点跑着 sglang 推理（16 die HBM 各约 54GB，load≈32），需独占节点复测 |
-| T3 | A5 实测 | 待设备 |
+| P0 | 环境搭建 + 上游代码获取 | 可运行环境 |
+| P1 | A2/A3 功能验证（不改代码先跑通） | pytest 全量通过 |
+| P2 | A2 性能基线 | 逐配置 ratio 表 |
+| P3 | 实现前向 F1（单遍 + 任意 H） | 前向达标 |
+| P4 | 实现反向 B1/B2（atomic + 大 H 两段） | 反向达标 |
+| P5 | A2/A3 全量复测 + profiling 根因 | 优化前后对比表 |
+| P6 | A5 复测（248 KB UB，复核 rsqrt lowering） | A5 测试记录 |
+| P7 | PR 提交至 `triton-ascend-kernels` experimental 分支 | PR |
+
+## 10. 风险
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| 小 shape（`n_rows` 小）时 grid < 核数，吃不满 AI Core | 单配置 ratio 抖动 | `n_rows` 自适应 grid + 逐 shape 选参 |
+| H 极大（> UB 单行容量）必须多遍 | 该配置难达标 | 两遍方案 + 与 torch 同策略对齐 |
+| A5 上 `rsqrt` / `atomic` lowering 差异 | 精度或崩溃 | 保留 `1/sqrt` 回退开关；A5 单独验证 |
+| A3 / A5 无设备 | 无法完成平台覆盖验收 | 需申请设备 |
+
+---
+
+## 11. 参考资料
+
+1. [liger-kernel/liger-kernel](https://github.com/linkedin/Liger-Kernel) v0.8.2
+2. [Triton-Ascend 文档](https://triton-ascend.readthedocs.io/zh-cn/latest/)
+3. [Triton-Ascend 算子开发指南](https://triton-ascend.readthedocs.io/zh-cn/latest/programming_guide/index.html)
+4. [Triton-Ascend 安装指南（版本配套矩阵）](https://triton-ascend.readthedocs.io/zh-cn/latest/installation_guide.html)
+5. 上游测试：`test/transformers/test_layer_norm.py`
+6. 上游 Benchmark：`benchmark/scripts/benchmark_layer_norm.py`
